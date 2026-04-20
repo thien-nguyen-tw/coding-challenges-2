@@ -6,15 +6,16 @@ import logging
 import os
 import uuid
 from datetime import datetime, timezone
+from typing import Annotated
 
-from fastapi import Request, status
+from fastapi import Header, Query, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from google.protobuf import timestamp_pb2
 from cqrs.charging_callbacks import record_actual_cost_after_callback
 from cqrs.dispatch_pipeline import iso_string_to_timestamp, orchestrate_select_charge_publish
 from cqrs.transitions import record_transition
-from kpis import build_sms_kpis
+from kpis import build_sms_kpis, parse_iso_datetime
 from lifespan import notification_lifespan
 from otp_http_client import OtpIssueError, issue_challenge_http, substitute_otp_in_content
 from pipeline_runtime import list_pipeline_events, pipe
@@ -40,6 +41,24 @@ from models import Notification, is_valid_transition
 logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_ATTEMPTS = 3
+
+_CALLING_DOMAIN_MAX_LEN = 128
+
+
+def _normalize_x_calling_domain(raw: str | None) -> str | None:
+    """Return stripped caller label for US2-style analytics, or None if absent/blank."""
+    if raw is None:
+        return None
+    s = raw.strip()
+    if not s:
+        return None
+    if len(s) > _CALLING_DOMAIN_MAX_LEN:
+        raise ValueError(
+            f"X-Calling-Domain must be at most {_CALLING_DOMAIN_MAX_LEN} characters"
+        )
+    if any(ch in s for ch in ("\n", "\r", "\x00")):
+        raise ValueError("X-Calling-Domain contains invalid characters")
+    return s
 
 RETRYABLE_STATES: frozenset[str] = frozenset({"Send-failed", "Carrier-rejected"})
 
@@ -88,7 +107,21 @@ async def derive_carrier(phone_number: str) -> str:
 )
 async def create_notification_endpoint(
     body: CreateNotificationRequest,
+    x_calling_domain: Annotated[
+        str | None,
+        Header(alias="X-Calling-Domain", convert_underscores=False),
+    ] = None,
 ) -> dict[str, object] | JSONResponse:
+    try:
+        calling_domain = _normalize_x_calling_domain(x_calling_domain)
+    except ValueError as exc:
+        return error_response(
+            "VALIDATION_ERROR",
+            str(exc),
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            {},
+        )
+
     if body.channel_type != "SMS":
         return error_response(
             "VALIDATION_ERROR",
@@ -108,6 +141,8 @@ async def create_notification_endpoint(
         "country_code": body.channel_payload.country_code,
         "phone_number": body.channel_payload.phone_number,
     }
+    if calling_domain is not None:
+        payload["calling_domain"] = calling_domain
 
     content_final = body.content
     otp_challenge_id: str | None = None
@@ -152,6 +187,7 @@ async def create_notification_endpoint(
         message_id=n.message_id,
         state=n.state,
         issue_server_otp=body.issue_server_otp,
+        calling_domain=calling_domain,
     )
     data = notification_to_dict(n)
     expose_plain = os.environ.get("OTP_EXPOSE_PLAINTEXT_TO_CLIENT", "true").lower() in (
@@ -165,9 +201,44 @@ async def create_notification_endpoint(
 
 
 @app.get("/notifications/kpis")
-async def get_sms_kpis_endpoint() -> dict[str, object]:
+async def get_sms_kpis_endpoint(
+    created_from_raw: str | None = Query(
+        None,
+        alias="from",
+        description=(
+            "ISO 8601 inclusive lower bound on notification created_at "
+            "(UTC; naive datetimes are interpreted as UTC)."
+        ),
+    ),
+    created_to_raw: str | None = Query(
+        None,
+        alias="to",
+        description="ISO 8601 inclusive upper bound on notification created_at (UTC).",
+    ),
+) -> dict[str, object]:
     """Aggregate SMS cost/volume/success KPIs (User Story 5); reads in-memory notification store."""
-    return success_response(build_sms_kpis())
+    dt_from = None
+    dt_to = None
+    try:
+        if created_from_raw is not None:
+            dt_from = parse_iso_datetime(created_from_raw)
+        if created_to_raw is not None:
+            dt_to = parse_iso_datetime(created_to_raw)
+    except ValueError:
+        return error_response(
+            "VALIDATION_ERROR",
+            "Invalid ISO 8601 datetime for from or to query parameter",
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            {},
+        )
+    if dt_from is not None and dt_to is not None and dt_from > dt_to:
+        return error_response(
+            "VALIDATION_ERROR",
+            "Query parameter from must be less than or equal to to",
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            {},
+        )
+    return success_response(build_sms_kpis(created_from=dt_from, created_to=dt_to))
 
 
 @app.get("/notifications/{notification_id}", response_model=None)
