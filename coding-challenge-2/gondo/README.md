@@ -436,5 +436,35 @@ Generated Python stubs are written to `libs/grpc-contracts/generated/`.
 ## With More Time, We Would...
 - Review and improve all functionalities defined in [Backlog](./docs/backlog/README.md)
 
+## Architectural Trade-offs & Design Decisions
+
+Building a robust SMS platform requires balancing developer velocity, system resilience, and operational complexity. Below is a summary of the core architectural decisions made in this project and their inherent trade-offs.
+
+### 1. Communication & API Contracts (gRPC, NATS, REST)
+The system exposes REST/OpenAPI to external clients while relying on gRPC and NATS for internal microservice orchestration.
+
+| Decision | The Upside (Pros) | The Trade-off (Cons & Risks) |
+| :--- | :--- | :--- |
+| **Dual Contracts (REST + gRPC)** | External clients get human-readable JSON; internal services get fast, strictly-typed Protobuf speed. | High maintenance burden. Crossing boundaries requires updating protos, Python stubs, and OpenAPI specs. |
+| **Async NATS Dispatch** | Non-blocking hot path. Prevents slow external carrier HTTP APIs from bottlenecking internal core routing. | Standard NATS is "fire-and-forget." Without JetStream, messages risk being dropped during container restarts. |
+| **Sync `charging-service`** | Strict financial constraints. We guarantee an SMS is never sent unless we can verify and estimate the cost. | Creates a hard availability dependency. If the charging service crashes, the entire SMS flow is blocked. |
+
+### 2. Data & State Management
+We use a hybrid approach: PostgreSQL for relational state, YAML for GitOps-driven registries, and in-memory stores for temporary notifications.
+
+| Decision | The Upside (Pros) | The Trade-off (Cons & Risks) |
+| :--- | :--- | :--- |
+| **YAML Provider Registries** | Excellent GitOps workflow. Changes go through PRs, code reviews, and CI testing instead of manual DB edits. | Requires rolling pod restarts to apply new routing rules, increasing Time to Mitigate (TTM) during an incident. |
+| **In-Memory Notifications** | Extremely fast iteration and rapid simulation during the initial development/challenge phase. | Lack of durability. A service restart permanently wipes the user notification history. |
+
+### 3. Developer Experience (DevEx) & Security
+To facilitate easy testing and UI integration, certain security constraints were relaxed via feature flags.
+
+| Decision | The Upside (Pros) | The Trade-off (Cons & Risks) |
+| :--- | :--- | :--- |
+| **OTP Plaintext Flag** | Frictionless E2E demo experience. The frontend can be tested without needing real hardware or SMS catchers. | Critical security risk if `OTP_EXPOSE_PLAINTEXT_TO_CLIENT` defaults to true or leaks into production. |
+
 ## AI Tools Used (if any)
 - Cursor
+
+## [Presentation slide](https://docs.google.com/presentation/d/1v-xq6cms4Ip1EgFP4nzLUCWIbdDr-vOtCvZ1wR0u-RU/edit?usp=sharing)
