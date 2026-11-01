@@ -139,7 +139,7 @@ adapters/
 frameworks/         Spring wiring: owned topics, properties, beans
 ```
 
-Each lifecycle (ride, dispatch request, offer, driver assignment) is an enum of transitions; the SQL compare-and-set guards are built from it, so a rule lives in one place. The [glossary](docs/architecture.md#ubiquitous-language) maps each context's terms.
+Each lifecycle (ride, dispatch request, offer, driver assignment) is an enum of transitions; the SQL compare-and-set guards are built from it, so a rule lives in one place.
 
 ### Architecture
 
